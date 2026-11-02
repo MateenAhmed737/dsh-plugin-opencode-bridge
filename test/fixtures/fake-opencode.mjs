@@ -137,6 +137,10 @@ async function runTurn(session, text, files) {
     return
   }
   if (text.includes('[[bash]]')) {
+    // Reasoning before the tool call, text after it (both ordinal 0 in 2.x).
+    const before = t.reasoningPart()
+    before.delta('I should run the command.')
+    before.end()
     const requestID = id('per')
     const reply = new Promise((resolve) => pendingPermissions.set(requestID, resolve))
     t.permission(requestID, 'ls -la')
@@ -167,7 +171,8 @@ async function runTurn(session, text, files) {
 function sessionApi(session) {
   const sessionID = session.id
   const messageID = id('msg')
-  let ordinal = 0
+  // Like OpenCode 2: ordinals count per kind within an assistant message.
+  const ordinals = { text: 0, reasoning: 0 }
   if (!V2) {
     return {
       start() {
@@ -234,7 +239,7 @@ function sessionApi(session) {
     },
   }
   function partV2(kind) {
-    const n = ordinal++
+    const n = ordinals[kind]++
     let text = ''
     return {
       delta(d) { text += d; emit2(`session.${kind}.delta`, { sessionID, assistantMessageID: messageID, ordinal: n, delta: d }) },

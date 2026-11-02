@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { Codes } from '../src/errors.ts'
 import { OpenCodeRuntime, verifyServer } from '../src/runtime.ts'
 import { alive, FAKE_OPENCODE, makeRuntime, quietLogger, readLog, tempLog, waitFor } from './helpers.ts'
@@ -112,5 +113,44 @@ describe('runtime failures and recovery', () => {
     } finally {
       await owner.dispose()
     }
+  })
+})
+
+describe('host killed without cleanup', () => {
+  for (const version of ['1.15.0', '2.2.5']) {
+    it(`the watchdog stops OpenCode ${version} when the host dies`, async () => {
+      const { spawn } = await import('node:child_process')
+      const log = tempLog()
+      const host = spawn(process.execPath, ['--experimental-strip-types', '--no-warnings', fileURLToPath(new URL('./fixtures/host.ts', import.meta.url)), version, log], { stdio: ['ignore', 'pipe', 'inherit'] })
+      await new Promise<void>((resolve, reject) => {
+        host.stdout.on('data', (chunk: Buffer) => { if (chunk.toString().includes('ready')) resolve() })
+        host.once('exit', (code) => reject(new Error(`host exited early (${code})`)))
+      })
+      const start = readLog(log).find((e) => e.kind === 'start')!
+      assert.ok(alive(start.pid))
+      host.kill('SIGKILL')
+      await waitFor(() => !alive(start.pid) && !alive(start.helperPid), 8_000, 'server to stop after the host was killed')
+    })
+  }
+})
+
+describe('Windows npm shims', () => {
+  it('runs the .exe behind an npm .cmd shim directly', async () => {
+    const { mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { resolveWindowsShim } = await import('../src/runtime.ts')
+    const dir = mkdtempSync(join(tmpdir(), 'npm shim '))
+    const exe = join(dir, 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe')
+    mkdirSync(join(dir, 'node_modules', '@opencode', 'cli', 'bin'), { recursive: true })
+    writeFileSync(exe, '')
+    const shim = join(dir, 'opencode.cmd')
+    writeFileSync(shim, '@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe"   %*\r\n')
+    assert.equal(resolveWindowsShim(shim, 'win32'), exe)
+    // A shim for a JS launcher (runs node) is kept as is.
+    const jsShim = join(dir, 'other.cmd')
+    writeFileSync(jsShim, '"%_prog%"  "%dp0%\\node_modules\\opencode-ai\\bin\\opencode" %*\r\n')
+    assert.equal(resolveWindowsShim(jsShim, 'win32'), jsShim)
+    assert.equal(resolveWindowsShim(shim, 'linux'), shim)
   })
 })

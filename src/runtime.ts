@@ -15,7 +15,9 @@
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
 import net from 'node:net'
+import path from 'node:path'
 import { BridgeError, Codes, describeError, redact } from './errors.ts'
 import { configContent } from './permissions.ts'
 import { compareSemver, parseSemver } from './semver.ts'
@@ -72,6 +74,7 @@ export interface RuntimeDeps {
 
 interface Running {
   child: ChildProcess
+  watchdog: ChildProcess | undefined
   connection: ServerConnection
   password: string
 }
@@ -102,7 +105,7 @@ async function getJson(url: string, password: string | undefined): Promise<{ sta
  * generation (a server we started); omitted, both are probed (attach mode),
  * like T3 Code's versionProbe.ts.
  */
-export async function verifyServer(url: string, password: string | undefined, api?: ApiGeneration): Promise<{ version: string; api: ApiGeneration }> {
+export async function verifyServer(url: string, password: string | undefined, api?: ApiGeneration): Promise<{ version: string; api: ApiGeneration; pid?: number }> {
   const base = url.replace(/\/+$/, '')
   const order: ApiGeneration[] = api ? [api] : ['v2', 'v1']
   let lastStatus: number | undefined
@@ -122,7 +125,7 @@ export async function verifyServer(url: string, password: string | undefined, ap
     if (generation === 'v1' && body.healthy !== true) continue
     if (generation === 'v2' && typeof body.pid !== 'number') continue
     assertVersion(body.version)
-    return { version: body.version, api: generation }
+    return { version: body.version, api: generation, ...(typeof body.pid === 'number' ? { pid: body.pid } : {}) }
   }
   throw new BridgeError(
     `The server at ${url} did not answer like an OpenCode server${lastStatus ? ` (HTTP ${lastStatus})` : ''}. OpenCode v${MINIMUM_OPENCODE_VERSION} or newer is required.`,
@@ -200,9 +203,71 @@ function needsShell(file: string, platform: NodeJS.Platform): boolean {
   return platform === 'win32' && /\.(cmd|bat)$/i.test(file)
 }
 
-/** With `shell: true` Node joins the command line unquoted; quote paths like `C:\Users\A B\...\opencode.cmd`. */
-function commandFor(file: string, platform: NodeJS.Platform): string {
-  return needsShell(file, platform) && !file.startsWith('"') ? `"${file}"` : file
+/**
+ * npm installs `opencode.cmd` shims on Windows. Running a shim goes through
+ * cmd.exe, and if the host is killed hard, cmd.exe dies while the real
+ * opencode.exe it started lives on. When the shim just forwards to an .exe,
+ * run that .exe directly instead.
+ */
+export function resolveWindowsShim(file: string, platform: NodeJS.Platform = process.platform): string {
+  if (!needsShell(file, platform)) return file
+  try {
+    const text = readFileSync(file, 'utf8')
+    const targets = [...text.matchAll(/"%(?:~)?dp0%\\?([^"]+?\.exe)"/gi)].map((m) => m[1]!)
+    for (const relative of targets.reverse()) {
+      const target = path.join(path.dirname(file), relative.replace(/[\\/]+/g, path.sep))
+      if (!/[\\/]node\.exe$/i.test(target) && existsSync(target)) return target
+    }
+  } catch { /* keep the shim */ }
+  return file
+}
+
+/** One command line for `shell: true` (Node joins args unquoted anyway); quotes paths like `C:\Users\A B\...\opencode.cmd`. */
+function shellLine(file: string, args: readonly string[]): string {
+  return [`"${file}"`, ...args].join(' ')
+}
+
+function spawnArgs(file: string, args: string[], platform: NodeJS.Platform): [string, string[], boolean] {
+  return needsShell(file, platform) ? [shellLine(file, args), [], true] : [file, args, false]
+}
+
+/**
+ * A small detached process that kills the server if the host dies without
+ * running its exit handlers (killed from Task Manager, SIGKILL, crash).
+ * Exits by itself once the server is gone. Skipped when this runtime cannot
+ * run plain Node scripts (an Electron host without ELECTRON_RUN_AS_NODE).
+ */
+const WATCHDOG = `
+const [parent, ...targets] = process.argv.slice(1).map(Number);
+const { spawnSync } = require('node:child_process');
+const alive = (pid) => { try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' } };
+setInterval(() => {
+  if (!targets.some(alive)) process.exit(0);
+  if (alive(parent)) return;
+  for (const pid of targets) {
+    if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    else { try { process.kill(-pid, 'SIGKILL') } catch { try { process.kill(pid, 'SIGKILL') } catch {} } }
+  }
+  process.exit(0);
+}, 1000);
+`
+
+export function startWatchdog(targets: readonly number[], logger?: Logger): ChildProcess | undefined {
+  if (process.versions.electron && !process.env.ELECTRON_RUN_AS_NODE) return undefined
+  try {
+    const watchdog = spawn(process.execPath, ['-e', WATCHDOG, String(process.pid), ...targets.map(String)], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: '' },
+    })
+    watchdog.on('error', () => {})
+    watchdog.unref()
+    return watchdog
+  } catch (error) {
+    logger?.debug('opencode-bridge: watchdog not started: %s', describeError(error))
+    return undefined
+  }
 }
 
 /**
@@ -272,12 +337,13 @@ export class OpenCodeRuntime {
 
   /** `opencode --version`, with a clear error when the binary is missing or too old. */
   private probeVersion(file: string, env: NodeJS.ProcessEnv): string {
-    const result = spawnSync(commandFor(file, this.platform), ['--version'], {
+    const [command, commandArgs, shell] = spawnArgs(file, ['--version'], this.platform)
+    const result = spawnSync(command, commandArgs, {
       env,
       encoding: 'utf8',
       timeout: 20_000,
       windowsHide: true,
-      shell: needsShell(file, this.platform),
+      shell,
     })
     if (result.error) {
       const code = (result.error as NodeJS.ErrnoException).code
@@ -296,7 +362,7 @@ export class OpenCodeRuntime {
   private async start(settings: RuntimeSettings): Promise<ServerConnection> {
     if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = undefined }
     const env = { ...(this.deps.env?.() ?? process.env) }
-    const file = await this.resolveBinary(settings.binaryPath, env)
+    const file = resolveWindowsShim(await this.resolveBinary(settings.binaryPath, env), this.platform)
     const cliVersion = this.probeVersion(file, env)
     const api = apiOf(cliVersion)
 
@@ -304,12 +370,13 @@ export class OpenCodeRuntime {
     const password = randomBytes(24).toString('base64url')
     const childEnv = serverEnvironment(env, password, api)
     const args = ['serve', `--hostname=${HOSTNAME}`, `--port=${port}`]
-    const child = spawn(commandFor(file, this.platform), args, {
+    const [command, commandArgs, shell] = spawnArgs(file, args, this.platform)
+    const child = spawn(command, commandArgs, {
       env: childEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: this.platform !== 'win32',
       windowsHide: true,
-      shell: needsShell(file, this.platform),
+      shell,
     })
 
     let stdout = ''
@@ -358,8 +425,11 @@ export class OpenCodeRuntime {
     stderr = ''
 
     let version: string
+    let serverPid: number | undefined
     try {
-      version = (await verifyServer(url, password, api)).version
+      const verified = await verifyServer(url, password, api)
+      version = verified.version
+      serverPid = verified.pid
     } catch (error) {
       killTree(child, 'SIGKILL', this.platform)
       throw error
@@ -370,7 +440,9 @@ export class OpenCodeRuntime {
     }
 
     const connection: ServerConnection = { url, version, api, external: false, password, serial: ++this.serial }
-    this.running = { child, connection, password }
+    const targets = [child.pid, serverPid].filter((pid): pid is number => typeof pid === 'number' && pid > 0)
+    const watchdog = startWatchdog([...new Set(targets)], this.deps.logger)
+    this.running = { child, watchdog, connection, password }
     this.restartAttempts = 0
     this.lastError = undefined
     child.once('exit', (code, signal) => this.onExit(child, code, signal))
@@ -409,6 +481,7 @@ export class OpenCodeRuntime {
     const running = this.running
     this.running = undefined
     if (running) killTree(running.child, 'SIGKILL', this.platform)
+    try { running?.watchdog?.kill() } catch { /* gone */ }
   }
 
   /** Stop the server: SIGTERM the group, then SIGKILL after a grace period. */
@@ -423,8 +496,11 @@ export class OpenCodeRuntime {
     this.external = undefined
     if (!running) return
     const { child } = running
+    // The watchdog exits by itself once the server is gone; stop it now anyway.
+    const stopWatchdog = () => { try { running.watchdog?.kill() } catch { /* gone */ } }
     if (child.exitCode !== null || child.signalCode !== null) {
       killTree(child, 'SIGKILL', this.platform)
+      stopWatchdog()
       return
     }
     const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()))
@@ -433,6 +509,7 @@ export class OpenCodeRuntime {
     await Promise.race([exited, timer])
     // The group may hold helpers even after the leader exited.
     killTree(child, 'SIGKILL', this.platform)
+    stopWatchdog()
   }
 
   get lastStartError(): BridgeError | undefined {
