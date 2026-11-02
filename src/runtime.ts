@@ -13,7 +13,7 @@
  * - or attach to a server the user already runs (serverUrl + serverPassword)
  */
 
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import net from 'node:net'
@@ -75,6 +75,8 @@ export interface RuntimeDeps {
 interface Running {
   child: ChildProcess
   watchdog: ChildProcess | undefined
+  /** Server-side pids besides the child (2.x reported pid, Windows shim descendants). */
+  pids: number[]
   connection: ServerConnection
   password: string
 }
@@ -161,6 +163,18 @@ export function parseListeningUrl(output: string): string | null {
     if (match?.[1]) return match[1]
   }
   return null
+}
+
+/** Kill extra pids (and their trees on Windows) that may have outlived their parent. */
+export function killPids(pids: readonly number[], platform: NodeJS.Platform = process.platform): void {
+  for (const pid of pids) {
+    if (platform === 'win32') {
+      try { spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }) } catch { /* gone */ }
+    } else {
+      try { process.kill(pid, 0) } catch { continue }
+      try { process.kill(-pid, 'SIGKILL') } catch { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } }
+    }
+  }
 }
 
 /** Kill a whole process group (POSIX) or process tree (Windows). Safe to call twice. */
@@ -251,6 +265,35 @@ setInterval(() => {
   process.exit(0);
 }, 1000);
 `
+
+/**
+ * Windows: every process below `root` (cmd.exe shim → node launcher → opencode).
+ * cmd.exe can die with the host while its children live on, so the watchdog
+ * needs their pids up front. Best effort; empty on any failure.
+ */
+export function windowsDescendants(root: number): Promise<number[]> {
+  return new Promise((resolve) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }'],
+    { windowsHide: true, timeout: 15_000 }, (error, stdout) => {
+      if (error) return resolve([])
+      const children = new Map<number, number[]>()
+      for (const line of stdout.split(/\r?\n/)) {
+        const [pid, parent] = line.trim().split(/\s+/).map(Number)
+        if (!pid || parent === undefined || Number.isNaN(parent)) continue
+        children.set(parent, [...(children.get(parent) ?? []), pid])
+      }
+      const out: number[] = []
+      const queue = [root]
+      while (queue.length) {
+        for (const child of children.get(queue.shift()!) ?? []) {
+          if (!out.includes(child)) { out.push(child); queue.push(child) }
+        }
+      }
+      resolve(out)
+    })
+  })
+}
 
 export function startWatchdog(targets: readonly number[], logger?: Logger): ChildProcess | undefined {
   if (process.versions.electron && !process.env.ELECTRON_RUN_AS_NODE) return undefined
@@ -434,15 +477,17 @@ export class OpenCodeRuntime {
       killTree(child, 'SIGKILL', this.platform)
       throw error
     }
+    const descendants = shell && child.pid !== undefined ? await windowsDescendants(child.pid) : []
+    const pids = [...new Set([child.pid, serverPid, ...descendants])].filter((pid): pid is number => typeof pid === 'number' && pid > 0)
     if (this.disposed) {
       killTree(child, 'SIGKILL', this.platform)
+      killPids(pids, this.platform)
       throw new BridgeError('The OpenCode bridge plugin was disposed.', Codes.TRANSPORT)
     }
 
     const connection: ServerConnection = { url, version, api, external: false, password, serial: ++this.serial }
-    const targets = [child.pid, serverPid].filter((pid): pid is number => typeof pid === 'number' && pid > 0)
-    const watchdog = startWatchdog([...new Set(targets)], this.deps.logger)
-    this.running = { child, watchdog, connection, password }
+    const watchdog = startWatchdog(pids, this.deps.logger)
+    this.running = { child, watchdog, pids, connection, password }
     this.restartAttempts = 0
     this.lastError = undefined
     child.once('exit', (code, signal) => this.onExit(child, code, signal))
@@ -451,10 +496,12 @@ export class OpenCodeRuntime {
   }
 
   private onExit(child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
-    if (this.running?.child !== child) return
+    const running = this.running
+    if (running?.child !== child) return
     this.running = undefined
     // Make sure helpers it spawned (LSPs, MCP servers) go too.
     killTree(child, 'SIGKILL', this.platform)
+    killPids(running.pids.filter((pid) => pid !== child.pid), this.platform)
     if (this.disposed) return
     this.deps.logger.warn('opencode-bridge: OpenCode server exited unexpectedly (%s); restarting', code ?? signal)
     this.scheduleRestart()
@@ -480,7 +527,7 @@ export class OpenCodeRuntime {
   private killNow(): void {
     const running = this.running
     this.running = undefined
-    if (running) killTree(running.child, 'SIGKILL', this.platform)
+    if (running) { killTree(running.child, 'SIGKILL', this.platform); killPids(running.pids, this.platform) }
     try { running?.watchdog?.kill() } catch { /* gone */ }
   }
 
@@ -497,7 +544,10 @@ export class OpenCodeRuntime {
     if (!running) return
     const { child } = running
     // The watchdog exits by itself once the server is gone; stop it now anyway.
-    const stopWatchdog = () => { try { running.watchdog?.kill() } catch { /* gone */ } }
+    const stopWatchdog = () => {
+      killPids(running.pids.filter((pid) => pid !== child.pid), this.platform)
+      try { running.watchdog?.kill() } catch { /* gone */ }
+    }
     if (child.exitCode !== null || child.signalCode !== null) {
       killTree(child, 'SIGKILL', this.platform)
       stopWatchdog()
