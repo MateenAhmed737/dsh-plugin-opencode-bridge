@@ -1,7 +1,11 @@
-# Publishes to npm when a version tag (v*) is pushed. Uses npm trusted
-# publishing (OIDC) with provenance, so no NPM_TOKEN secret is stored here:
-# link this repository and workflow file as a trusted publisher on npmjs.com
-# before the first release.
+# Publishes to npm with provenance when a version tag (v*) is pushed.
+#
+# Preferred: npm trusted publishing (OIDC). Link this repository and
+# `publish.yml` as a trusted publisher in the package's settings on npmjs.com;
+# no secret is stored. Trusted publishing can only be set up once the package
+# exists, so the very first release uses a short-lived granular token in the
+# NPM_TOKEN repository secret. Delete that secret after setting up trusted
+# publishing.
 name: publish
 
 on:
@@ -16,14 +20,25 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or newer.
+      - run: npm install -g npm@^11.5.1
       - run: npm ci
       - run: npm run check
       - name: Tag matches package.json version
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
-      - run: npm publish --provenance --access public
+      - name: Publish with token (first release)
+        if: ${{ env.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
+      - name: Publish with trusted publishing
+        if: ${{ env.NPM_TOKEN == '' }}
+        run: npm publish --provenance --access public
