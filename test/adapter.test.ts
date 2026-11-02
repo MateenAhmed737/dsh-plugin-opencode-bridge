@@ -106,6 +106,7 @@ for (const version of ['1.15.0', '2.2.5']) {
       assert.equal(result.finish.kind, 'stop')
       assert.match(result.text, /🚫 Rejected (bash|shell): ls -la/)
       assert.match(result.text, /permission reject: Permission "(bash|shell)" was not granted/)
+      assert.equal(result.reasoning, 'I should run the command.', 'text after a tool call stays text')
       const reply = readLog(log).find((e) => e.kind === 'request' && /\/reply$/.test(e.path))!
       assert.equal(v2 ? reply.body.decision : reply.body.reply, 'reject')
       assert.match(reply.body.message, /was not granted/)

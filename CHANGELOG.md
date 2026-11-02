@@ -10,4 +10,5 @@ First version.
 - One OpenCode session per DSH conversation; only the new turn is sent, and the session is rebuilt from the DSH transcript when the history changed.
 - T3 Code's permission policy, with restricted tools asked through DSH's approval prompt or rejected with a message the model sees. Nothing is configured as `deny`.
 - Streams text, reasoning, tool activity and token usage; supports abort and png/jpeg/gif/webp images up to 20 MB.
+- A watchdog stops the OpenCode server if DSH is killed without cleaning up, and on Windows the real `opencode.exe` behind npm's `.cmd` shim is run directly.
 - Maps OpenCode errors to DSH failures: 429 / FreeUsageLimitError → rate limit with OpenCode's message, 401/403 → auth, network and timeouts → transport.

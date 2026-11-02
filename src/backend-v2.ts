@@ -140,12 +140,16 @@ class Writer {
   append(key: string, kind: 'text' | 'reasoning', delta: string): void {
     if (!delta) return
     let block = this.blocks.get(key)
-    if (!block) {
+    // A closed block never takes more text; a reused key starts a new block.
+    if (!block || block.ended || block.kind !== kind) {
+      if (block && !block.ended) {
+        block.ended = true
+        this.pending.push({ type: 'block-end', index: block.index, block: { type: block.kind, text: block.text } })
+      }
       block = { index: this.next++, kind, text: '', ended: false }
       this.blocks.set(key, block)
       this.pending.push({ type: 'block-start', index: block.index, blockType: kind })
     }
-    if (block.ended) return
     block.text += delta
     if (kind === 'text') this.text += delta
     this.pending.push(kind === 'text'
@@ -381,7 +385,8 @@ export async function* runTurnV2(client: OpenCodeClient, input: TurnRunInput): A
       }
       if (d.sessionID !== sessionID) continue
 
-      const key = `${d.assistantMessageID}:${d.ordinal}`
+      // Ordinals count per kind (text 0, reasoning 0, ...), so the kind is part of the key, as in T3 Code.
+      const key = `${d.assistantMessageID}:${type.startsWith('session.reasoning.') ? 'reasoning' : 'text'}:${d.ordinal}`
       switch (type) {
         case 'session.text.delta':
           writer.append(key, 'text', String(d.delta ?? ''))

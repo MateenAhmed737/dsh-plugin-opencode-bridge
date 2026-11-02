@@ -13,9 +13,11 @@
  * - or attach to a server the user already runs (serverUrl + serverPassword)
  */
 
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
 import net from 'node:net'
+import path from 'node:path'
 import { BridgeError, Codes, describeError, redact } from './errors.ts'
 import { configContent } from './permissions.ts'
 import { compareSemver, parseSemver } from './semver.ts'
@@ -72,6 +74,9 @@ export interface RuntimeDeps {
 
 interface Running {
   child: ChildProcess
+  watchdog: ChildProcess | undefined
+  /** Server-side pids besides the child (2.x reported pid, Windows shim descendants). */
+  pids: number[]
   connection: ServerConnection
   password: string
 }
@@ -102,7 +107,7 @@ async function getJson(url: string, password: string | undefined): Promise<{ sta
  * generation (a server we started); omitted, both are probed (attach mode),
  * like T3 Code's versionProbe.ts.
  */
-export async function verifyServer(url: string, password: string | undefined, api?: ApiGeneration): Promise<{ version: string; api: ApiGeneration }> {
+export async function verifyServer(url: string, password: string | undefined, api?: ApiGeneration): Promise<{ version: string; api: ApiGeneration; pid?: number }> {
   const base = url.replace(/\/+$/, '')
   const order: ApiGeneration[] = api ? [api] : ['v2', 'v1']
   let lastStatus: number | undefined
@@ -122,7 +127,7 @@ export async function verifyServer(url: string, password: string | undefined, ap
     if (generation === 'v1' && body.healthy !== true) continue
     if (generation === 'v2' && typeof body.pid !== 'number') continue
     assertVersion(body.version)
-    return { version: body.version, api: generation }
+    return { version: body.version, api: generation, ...(typeof body.pid === 'number' ? { pid: body.pid } : {}) }
   }
   throw new BridgeError(
     `The server at ${url} did not answer like an OpenCode server${lastStatus ? ` (HTTP ${lastStatus})` : ''}. OpenCode v${MINIMUM_OPENCODE_VERSION} or newer is required.`,
@@ -158,6 +163,18 @@ export function parseListeningUrl(output: string): string | null {
     if (match?.[1]) return match[1]
   }
   return null
+}
+
+/** Kill extra pids (and their trees on Windows) that may have outlived their parent. */
+export function killPids(pids: readonly number[], platform: NodeJS.Platform = process.platform): void {
+  for (const pid of pids) {
+    if (platform === 'win32') {
+      try { spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }) } catch { /* gone */ }
+    } else {
+      try { process.kill(pid, 0) } catch { continue }
+      try { process.kill(-pid, 'SIGKILL') } catch { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } }
+    }
+  }
 }
 
 /** Kill a whole process group (POSIX) or process tree (Windows). Safe to call twice. */
@@ -200,9 +217,116 @@ function needsShell(file: string, platform: NodeJS.Platform): boolean {
   return platform === 'win32' && /\.(cmd|bat)$/i.test(file)
 }
 
-/** With `shell: true` Node joins the command line unquoted; quote paths like `C:\Users\A B\...\opencode.cmd`. */
-function commandFor(file: string, platform: NodeJS.Platform): string {
-  return needsShell(file, platform) && !file.startsWith('"') ? `"${file}"` : file
+/**
+ * npm installs `opencode.cmd` shims on Windows. Running a shim goes through
+ * cmd.exe, and if the host is killed hard, cmd.exe dies while the real
+ * opencode.exe it started lives on. When the shim just forwards to an .exe,
+ * run that .exe directly instead.
+ */
+export function resolveWindowsShim(file: string, platform: NodeJS.Platform = process.platform): string {
+  if (!needsShell(file, platform)) return file
+  try {
+    const text = readFileSync(file, 'utf8')
+    const targets = [...text.matchAll(/"%(?:~)?dp0%\\?([^"]+?\.exe)"/gi)].map((m) => m[1]!)
+    for (const relative of targets.reverse()) {
+      const target = path.join(path.dirname(file), relative.replace(/[\\/]+/g, path.sep))
+      if (!/[\\/]node\.exe$/i.test(target) && existsSync(target)) return target
+    }
+  } catch { /* keep the shim */ }
+  return file
+}
+
+/** One command line for `shell: true` (Node joins args unquoted anyway); quotes paths like `C:\Users\A B\...\opencode.cmd`. */
+function shellLine(file: string, args: readonly string[]): string {
+  return [`"${file}"`, ...args].join(' ')
+}
+
+function spawnArgs(file: string, args: string[], platform: NodeJS.Platform): [string, string[], boolean] {
+  return needsShell(file, platform) ? [shellLine(file, args), [], true] : [file, args, false]
+}
+
+/**
+ * A small detached process that kills the server if the host dies without
+ * running its exit handlers (killed from Task Manager, SIGKILL, crash).
+ * Exits by itself once the server is gone. Skipped when this runtime cannot
+ * run plain Node scripts (an Electron host without ELECTRON_RUN_AS_NODE).
+ */
+const WATCHDOG = `
+const [parent, ...targets] = process.argv.slice(1).map(Number);
+const { spawnSync } = require('node:child_process');
+const alive = (pid) => { try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' } };
+const tree = () => {
+  // Windows keeps a dead parent's pid in ParentProcessId, so the whole tree can
+  // still be found after cmd.exe (a .cmd shim) died together with the host.
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }'],
+    { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+  const children = new Map();
+  for (const line of String(r.stdout || '').split(/\\r?\\n/)) {
+    const [pid, ppid] = line.trim().split(/\\s+/).map(Number);
+    if (pid && ppid >= 0) children.set(ppid, [...(children.get(ppid) || []), pid]);
+  }
+  const seen = new Set(targets);
+  const queue = [...targets];
+  while (queue.length) for (const c of children.get(queue.shift()) || []) if (!seen.has(c) && c !== process.pid) { seen.add(c); queue.push(c) }
+  return [...seen];
+};
+setInterval(() => {
+  if (alive(parent)) { if (!targets.some(alive)) process.exit(0); return; }
+  if (process.platform === 'win32') {
+    for (const pid of tree()) spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+  } else {
+    for (const pid of targets) { try { process.kill(-pid, 'SIGKILL') } catch { try { process.kill(pid, 'SIGKILL') } catch {} } }
+  }
+  process.exit(0);
+}, 1000);
+`
+
+/**
+ * Windows: every process below `root` (cmd.exe shim → node launcher → opencode).
+ * cmd.exe can die with the host while its children live on, so the watchdog
+ * needs their pids up front. Best effort; empty on any failure.
+ */
+export function windowsDescendants(root: number): Promise<number[]> {
+  return new Promise((resolve) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }'],
+    { windowsHide: true, timeout: 15_000 }, (error, stdout) => {
+      if (error) return resolve([])
+      const children = new Map<number, number[]>()
+      for (const line of stdout.split(/\r?\n/)) {
+        const [pid, parent] = line.trim().split(/\s+/).map(Number)
+        if (!pid || parent === undefined || Number.isNaN(parent)) continue
+        children.set(parent, [...(children.get(parent) ?? []), pid])
+      }
+      const out: number[] = []
+      const queue = [root]
+      while (queue.length) {
+        for (const child of children.get(queue.shift()!) ?? []) {
+          if (!out.includes(child)) { out.push(child); queue.push(child) }
+        }
+      }
+      resolve(out)
+    })
+  })
+}
+
+export function startWatchdog(targets: readonly number[], logger?: Logger): ChildProcess | undefined {
+  if (process.versions.electron && !process.env.ELECTRON_RUN_AS_NODE) return undefined
+  try {
+    const watchdog = spawn(process.execPath, ['-e', WATCHDOG, String(process.pid), ...targets.map(String)], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: '' },
+    })
+    watchdog.on('error', () => {})
+    watchdog.unref()
+    return watchdog
+  } catch (error) {
+    logger?.debug('opencode-bridge: watchdog not started: %s', describeError(error))
+    return undefined
+  }
 }
 
 /**
@@ -272,12 +396,13 @@ export class OpenCodeRuntime {
 
   /** `opencode --version`, with a clear error when the binary is missing or too old. */
   private probeVersion(file: string, env: NodeJS.ProcessEnv): string {
-    const result = spawnSync(commandFor(file, this.platform), ['--version'], {
+    const [command, commandArgs, shell] = spawnArgs(file, ['--version'], this.platform)
+    const result = spawnSync(command, commandArgs, {
       env,
       encoding: 'utf8',
       timeout: 20_000,
       windowsHide: true,
-      shell: needsShell(file, this.platform),
+      shell,
     })
     if (result.error) {
       const code = (result.error as NodeJS.ErrnoException).code
@@ -296,7 +421,7 @@ export class OpenCodeRuntime {
   private async start(settings: RuntimeSettings): Promise<ServerConnection> {
     if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = undefined }
     const env = { ...(this.deps.env?.() ?? process.env) }
-    const file = await this.resolveBinary(settings.binaryPath, env)
+    const file = resolveWindowsShim(await this.resolveBinary(settings.binaryPath, env), this.platform)
     const cliVersion = this.probeVersion(file, env)
     const api = apiOf(cliVersion)
 
@@ -304,12 +429,13 @@ export class OpenCodeRuntime {
     const password = randomBytes(24).toString('base64url')
     const childEnv = serverEnvironment(env, password, api)
     const args = ['serve', `--hostname=${HOSTNAME}`, `--port=${port}`]
-    const child = spawn(commandFor(file, this.platform), args, {
+    const [command, commandArgs, shell] = spawnArgs(file, args, this.platform)
+    const child = spawn(command, commandArgs, {
       env: childEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: this.platform !== 'win32',
       windowsHide: true,
-      shell: needsShell(file, this.platform),
+      shell,
     })
 
     let stdout = ''
@@ -358,31 +484,52 @@ export class OpenCodeRuntime {
     stderr = ''
 
     let version: string
+    let serverPid: number | undefined
     try {
-      version = (await verifyServer(url, password, api)).version
+      const verified = await verifyServer(url, password, api)
+      version = verified.version
+      serverPid = verified.pid
     } catch (error) {
       killTree(child, 'SIGKILL', this.platform)
       throw error
     }
+    const pids = [...new Set([child.pid, serverPid])].filter((pid): pid is number => typeof pid === 'number' && pid > 0)
     if (this.disposed) {
       killTree(child, 'SIGKILL', this.platform)
+      killPids(pids, this.platform)
       throw new BridgeError('The OpenCode bridge plugin was disposed.', Codes.TRANSPORT)
     }
 
     const connection: ServerConnection = { url, version, api, external: false, password, serial: ++this.serial }
-    this.running = { child, connection, password }
+    const running: Running = { child, watchdog: undefined, pids, connection, password }
+    this.running = running
     this.restartAttempts = 0
     this.lastError = undefined
     child.once('exit', (code, signal) => this.onExit(child, code, signal))
     this.deps.logger.info('opencode-bridge: started OpenCode %s on %s', version, url)
+    running.watchdog = startWatchdog(running.pids, this.deps.logger)
+    if (shell && child.pid !== undefined) {
+      // For dispose and crash cleanup: the processes below the shim (listing them takes a second or two).
+      void windowsDescendants(child.pid).then((descendants) => {
+        const extra = descendants.filter((pid) => !running.pids.includes(pid))
+        if (this.running !== running) {
+          // Exited or disposed meanwhile: make sure nothing below the shim survives.
+          killPids(extra, this.platform)
+          return
+        }
+        running.pids.push(...extra)
+      })
+    }
     return connection
   }
 
   private onExit(child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
-    if (this.running?.child !== child) return
+    const running = this.running
+    if (running?.child !== child) return
     this.running = undefined
     // Make sure helpers it spawned (LSPs, MCP servers) go too.
     killTree(child, 'SIGKILL', this.platform)
+    killPids(running.pids.filter((pid) => pid !== child.pid), this.platform)
     if (this.disposed) return
     this.deps.logger.warn('opencode-bridge: OpenCode server exited unexpectedly (%s); restarting', code ?? signal)
     this.scheduleRestart()
@@ -408,7 +555,8 @@ export class OpenCodeRuntime {
   private killNow(): void {
     const running = this.running
     this.running = undefined
-    if (running) killTree(running.child, 'SIGKILL', this.platform)
+    if (running) { killTree(running.child, 'SIGKILL', this.platform); killPids(running.pids, this.platform) }
+    try { running?.watchdog?.kill() } catch { /* gone */ }
   }
 
   /** Stop the server: SIGTERM the group, then SIGKILL after a grace period. */
@@ -423,8 +571,14 @@ export class OpenCodeRuntime {
     this.external = undefined
     if (!running) return
     const { child } = running
+    // The watchdog exits by itself once the server is gone; stop it now anyway.
+    const stopWatchdog = () => {
+      killPids(running.pids.filter((pid) => pid !== child.pid), this.platform)
+      try { running.watchdog?.kill() } catch { /* gone */ }
+    }
     if (child.exitCode !== null || child.signalCode !== null) {
       killTree(child, 'SIGKILL', this.platform)
+      stopWatchdog()
       return
     }
     const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()))
@@ -433,6 +587,7 @@ export class OpenCodeRuntime {
     await Promise.race([exited, timer])
     // The group may hold helpers even after the leader exited.
     killTree(child, 'SIGKILL', this.platform)
+    stopWatchdog()
   }
 
   get lastStartError(): BridgeError | undefined {
