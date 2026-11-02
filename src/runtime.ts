@@ -255,12 +255,28 @@ const WATCHDOG = `
 const [parent, ...targets] = process.argv.slice(1).map(Number);
 const { spawnSync } = require('node:child_process');
 const alive = (pid) => { try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' } };
+const tree = () => {
+  // Windows keeps a dead parent's pid in ParentProcessId, so the whole tree can
+  // still be found after cmd.exe (a .cmd shim) died together with the host.
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }'],
+    { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+  const children = new Map();
+  for (const line of String(r.stdout || '').split(/\\r?\\n/)) {
+    const [pid, ppid] = line.trim().split(/\\s+/).map(Number);
+    if (pid && ppid >= 0) children.set(ppid, [...(children.get(ppid) || []), pid]);
+  }
+  const seen = new Set(targets);
+  const queue = [...targets];
+  while (queue.length) for (const c of children.get(queue.shift()) || []) if (!seen.has(c) && c !== process.pid) { seen.add(c); queue.push(c) }
+  return [...seen];
+};
 setInterval(() => {
-  if (!targets.some(alive)) process.exit(0);
-  if (alive(parent)) return;
-  for (const pid of targets) {
-    if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
-    else { try { process.kill(-pid, 'SIGKILL') } catch { try { process.kill(pid, 'SIGKILL') } catch {} } }
+  if (alive(parent)) { if (!targets.some(alive)) process.exit(0); return; }
+  if (process.platform === 'win32') {
+    for (const pid of tree()) spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+  } else {
+    for (const pid of targets) { try { process.kill(-pid, 'SIGKILL') } catch { try { process.kill(pid, 'SIGKILL') } catch {} } }
   }
   process.exit(0);
 }, 1000);
@@ -491,8 +507,9 @@ export class OpenCodeRuntime {
     this.lastError = undefined
     child.once('exit', (code, signal) => this.onExit(child, code, signal))
     this.deps.logger.info('opencode-bridge: started OpenCode %s on %s', version, url)
+    running.watchdog = startWatchdog(running.pids, this.deps.logger)
     if (shell && child.pid !== undefined) {
-      // Listing processes takes a second or two on Windows; don't hold up the first request.
+      // For dispose and crash cleanup: the processes below the shim (listing them takes a second or two).
       void windowsDescendants(child.pid).then((descendants) => {
         const extra = descendants.filter((pid) => !running.pids.includes(pid))
         if (this.running !== running) {
@@ -501,10 +518,7 @@ export class OpenCodeRuntime {
           return
         }
         running.pids.push(...extra)
-        running.watchdog = startWatchdog(running.pids, this.deps.logger)
       })
-    } else {
-      running.watchdog = startWatchdog(running.pids, this.deps.logger)
     }
     return connection
   }
