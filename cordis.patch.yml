@@ -1,0 +1,32 @@
+# Bundle config layer for dsh-plugin-opencode-bridge, applied to a DSH profile
+# when the plugin is installed. The row `id` is also the settings namespace for
+# the plugin's volatile settings, so it must match `name` in package.json.
+#
+# Every setting below can also be changed in DSH under Settings → Models →
+# OpenCode (local).
+- insert:
+  - id: dsh-plugin-opencode-bridge
+    name: dsh-plugin-opencode-bridge
+    config:
+      # Path or PATH name of your own opencode executable (>= 1.14.19).
+      binaryPath: 'opencode'
+      # Attach to an `opencode serve` you already run instead of starting one,
+      # e.g. http://127.0.0.1:4096, with its password. Empty = start one.
+      serverUrl: ''
+      serverPassword: ''
+      # Working directory for OpenCode sessions. Empty = the DSH conversation's.
+      cwd: ''
+      # bash, edit, webfetch, websearch, codesearch, external_directory and
+      # doom_loop are asked about. true = allow them without asking.
+      allowRestrictedTools: false
+      # Ask in DSH's approval prompt before allowing a restricted tool.
+      # false = reject them (the model is told why).
+      askForApproval: true
+      # Upper bound for one model turn, in ms (0 = none).
+      requestTimeoutMs: 1800000
+      # How often the model list is re-read from OpenCode, in seconds.
+      modelRefreshSeconds: 300
+      # Show OpenCode's tool activity as short lines in the reply.
+      showToolActivity: true
+      # Make session titles locally instead of spending a model request.
+      localSessionTitles: true

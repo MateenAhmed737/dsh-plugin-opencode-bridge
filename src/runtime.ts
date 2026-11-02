@@ -1,0 +1,446 @@
+/**
+ * The shared `opencode serve` process, started from the user's own OpenCode
+ * install with the user's full environment (HOME, XDG paths, auth.json,
+ * config) — the same method T3 Code uses (packages/provider-opencode/src/server/
+ * OpenCodeRuntime.ts, Copyright (c) 2026 T3 Tools Inc., MIT — see NOTICE.md).
+ *
+ * - one server per plugin instance, on 127.0.0.1 and a free port
+ * - a fresh random OPENCODE_SERVER_PASSWORD on each start
+ * - OPENCODE_CONFIG_CONTENT carries only the permission policy
+ * - readiness = "server listening on" + /global/health healthy with version ≥ 1.14.19
+ * - crash → restart with exponential backoff
+ * - dispose / process exit → kill the whole process group (POSIX) or tree (Windows)
+ * - or attach to a server the user already runs (serverUrl + serverPassword)
+ */
+
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import net from 'node:net'
+import { BridgeError, Codes, describeError, redact } from './errors.ts'
+import { configContent } from './permissions.ts'
+import { compareSemver, parseSemver } from './semver.ts'
+
+export const MINIMUM_OPENCODE_VERSION = '1.14.19'
+const HOSTNAME = '127.0.0.1'
+const STARTUP_TIMEOUT_MS = 30_000
+const HEALTH_TIMEOUT_MS = 5_000
+const OUTPUT_CAP = 16 * 1024
+const RESTART_BASE_MS = 1_000
+const RESTART_MAX_MS = 30_000
+const RESTART_MAX_ATTEMPTS = 6
+
+export const INSTALL_HINT =
+  'Install OpenCode (https://opencode.ai/docs/#install), for example `npm i -g opencode-ai`, ' +
+  'then sign in with `opencode auth login` if you use paid providers. ' +
+  'If it is installed somewhere not on PATH, set the plugin\'s `binaryPath` setting.'
+
+export interface RuntimeSettings {
+  binaryPath: string
+  serverUrl: string
+  serverPassword: string
+}
+
+/** OpenCode 1.x serves the `/global/health` + `/session` API; 2.x serves `/api/*`. */
+export type ApiGeneration = 'v1' | 'v2'
+
+export interface ServerConnection {
+  readonly url: string
+  readonly version: string
+  readonly api: ApiGeneration
+  readonly external: boolean
+  /** Server password (never logged). */
+  readonly password: string | undefined
+  /** Bumped on every (re)start or re-attach; lets callers notice a new server. */
+  readonly serial: number
+}
+
+export interface Logger {
+  debug(format: string, ...args: unknown[]): void
+  info(format: string, ...args: unknown[]): void
+  warn(format: string, ...args: unknown[]): void
+}
+
+export interface RuntimeDeps {
+  settings(): RuntimeSettings
+  /** Resolve a command name to an absolute path (DSH's ctx.subprocess). */
+  resolveExecutable?(command: string, env: Record<string, string>): Promise<string>
+  logger: Logger
+  /** Environment for the child; defaults to the full process.env. */
+  env?(): NodeJS.ProcessEnv
+  platform?: NodeJS.Platform
+}
+
+interface Running {
+  child: ChildProcess
+  connection: ServerConnection
+  password: string
+}
+
+export function basicAuth(password: string | undefined): Record<string, string> {
+  if (!password) return {}
+  return { Authorization: `Basic ${Buffer.from(`opencode:${password}`, 'utf8').toString('base64')}` }
+}
+
+export function apiOf(version: string): ApiGeneration {
+  return (parseSemver(version)?.major ?? 1) >= 2 ? 'v2' : 'v1'
+}
+
+async function getJson(url: string, password: string | undefined): Promise<{ status: number; json: unknown }> {
+  const response = await fetch(url, {
+    headers: { accept: 'application/json', ...basicAuth(password) },
+    signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+  })
+  const type = response.headers.get('content-type') ?? ''
+  let json: unknown
+  if (type.includes('application/json')) json = await response.json().catch(() => undefined)
+  else await response.body?.cancel().catch(() => {})
+  return { status: response.status, json }
+}
+
+/**
+ * Ask a server for its version and enforce the minimum. `api` forces one
+ * generation (a server we started); omitted, both are probed (attach mode),
+ * like T3 Code's versionProbe.ts.
+ */
+export async function verifyServer(url: string, password: string | undefined, api?: ApiGeneration): Promise<{ version: string; api: ApiGeneration }> {
+  const base = url.replace(/\/+$/, '')
+  const order: ApiGeneration[] = api ? [api] : ['v2', 'v1']
+  let lastStatus: number | undefined
+  for (const generation of order) {
+    let result: { status: number; json: unknown }
+    try {
+      result = await getJson(`${base}${generation === 'v2' ? '/api/info' : '/global/health'}`, password)
+    } catch (error) {
+      throw new BridgeError(`Could not reach the OpenCode server at ${url}: ${describeError(error)}`, Codes.TRANSPORT, undefined, { cause: error })
+    }
+    if (result.status === 401) {
+      throw new BridgeError(`The OpenCode server at ${url} rejected the server password.`, Codes.AUTH, 401)
+    }
+    lastStatus = result.status
+    const body = result.json as { version?: unknown; healthy?: unknown; pid?: unknown } | undefined
+    if (result.status !== 200 || !body || typeof body.version !== 'string') continue
+    if (generation === 'v1' && body.healthy !== true) continue
+    if (generation === 'v2' && typeof body.pid !== 'number') continue
+    assertVersion(body.version)
+    return { version: body.version, api: generation }
+  }
+  throw new BridgeError(
+    `The server at ${url} did not answer like an OpenCode server${lastStatus ? ` (HTTP ${lastStatus})` : ''}. OpenCode v${MINIMUM_OPENCODE_VERSION} or newer is required.`,
+    Codes.OPENCODE_VERSION,
+  )
+}
+
+export function assertVersion(version: string): void {
+  if (parseSemver(version) === null) {
+    throw new BridgeError(`OpenCode reported an unreadable version "${version}". OpenCode v${MINIMUM_OPENCODE_VERSION} or newer is required.`, Codes.OPENCODE_VERSION)
+  }
+  if (compareSemver(version, MINIMUM_OPENCODE_VERSION) < 0) {
+    throw new BridgeError(`OpenCode v${version} is too old. Upgrade to v${MINIMUM_OPENCODE_VERSION} or newer (\`opencode upgrade\` or \`npm i -g opencode-ai@latest\`).`, Codes.OPENCODE_VERSION)
+  }
+}
+
+export function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.unref()
+    server.on('error', reject)
+    server.listen(0, HOSTNAME, () => {
+      const address = server.address()
+      const port = typeof address === 'object' && address ? address.port : 0
+      server.close(() => (port ? resolve(port) : reject(new Error('no free port'))))
+    })
+  })
+}
+
+export function parseListeningUrl(output: string): string | null {
+  for (const line of output.split('\n')) {
+    const match = line.match(/server listening on\s+(https?:\/\/[^\s]+)/i)
+    if (match?.[1]) return match[1]
+  }
+  return null
+}
+
+/** Kill a whole process group (POSIX) or process tree (Windows). Safe to call twice. */
+export function killTree(child: ChildProcess, signal: NodeJS.Signals, platform: NodeJS.Platform = process.platform): void {
+  const pid = child.pid
+  if (pid === undefined) return
+  if (platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+    } catch { /* already gone */ }
+    return
+  }
+  try {
+    process.kill(-pid, signal)
+  } catch {
+    try { child.kill(signal) } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Environment for `opencode serve`: the user's full environment plus a fresh
+ * password. OpenCode 1.x reads OPENCODE_SERVER_PASSWORD and gets the permission
+ * policy through OPENCODE_CONFIG_CONTENT. OpenCode 2.x reads OPENCODE_PASSWORD
+ * (which overrides the 1.x variable, so that one is dropped) and receives the
+ * policy as session permission rules instead, as T3 Code does.
+ */
+export function serverEnvironment(env: NodeJS.ProcessEnv, password: string, api: ApiGeneration): NodeJS.ProcessEnv {
+  if (api === 'v2') {
+    const { OPENCODE_SERVER_PASSWORD: _drop, ...rest } = env
+    return { ...rest, OPENCODE_PASSWORD: password }
+  }
+  return {
+    ...env,
+    OPENCODE_SERVER_PASSWORD: password,
+    OPENCODE_CONFIG_CONTENT: configContent(env.OPENCODE_CONFIG_CONTENT),
+  }
+}
+
+function needsShell(file: string, platform: NodeJS.Platform): boolean {
+  return platform === 'win32' && /\.(cmd|bat)$/i.test(file)
+}
+
+/** With `shell: true` Node joins the command line unquoted; quote paths like `C:\Users\A B\...\opencode.cmd`. */
+function commandFor(file: string, platform: NodeJS.Platform): string {
+  return needsShell(file, platform) && !file.startsWith('"') ? `"${file}"` : file
+}
+
+/**
+ * Owns the shared server. `connect()` is single-flight and lazy: the first
+ * model list or request starts the server.
+ */
+export class OpenCodeRuntime {
+  private running: Running | undefined
+  private starting: Promise<ServerConnection> | undefined
+  private external: ServerConnection | undefined
+  private externalKey = ''
+  private disposed = false
+  private serial = 0
+  private restartAttempts = 0
+  private restartTimer: NodeJS.Timeout | undefined
+  private lastError: BridgeError | undefined
+  private readonly platform: NodeJS.Platform
+  private readonly exitHook = () => this.killNow()
+
+  private readonly deps: RuntimeDeps
+
+  constructor(deps: RuntimeDeps) {
+    this.deps = deps
+    this.platform = deps.platform ?? process.platform
+    process.once('exit', this.exitHook)
+  }
+
+  /** Current connection, starting or attaching as needed. */
+  async connect(): Promise<ServerConnection> {
+    if (this.disposed) throw new BridgeError('The OpenCode bridge plugin was disposed.', Codes.TRANSPORT)
+    const settings = this.deps.settings()
+    const serverUrl = settings.serverUrl.trim()
+    if (serverUrl) return this.attach(serverUrl, settings.serverPassword)
+    if (this.running && this.running.child.exitCode === null && this.running.child.signalCode === null) {
+      return this.running.connection
+    }
+    this.starting ??= this.start(settings).finally(() => { this.starting = undefined })
+    return this.starting
+  }
+
+  /** Whether a server is currently up (no start is triggered). */
+  get isRunning(): boolean {
+    return !!this.running && this.running.child.exitCode === null
+  }
+
+  private async attach(url: string, password: string): Promise<ServerConnection> {
+    const key = `${url}\u0000${password}`
+    if (this.external && this.externalKey === key) return this.external
+    const { version, api } = await verifyServer(url, password || undefined)
+    this.externalKey = key
+    this.external = { url, version, api, external: true, password: password || undefined, serial: ++this.serial }
+    this.deps.logger.info('opencode-bridge: attached to OpenCode %s at %s', version, url)
+    return this.external
+  }
+
+  private async resolveBinary(binaryPath: string, env: NodeJS.ProcessEnv): Promise<string> {
+    const command = binaryPath.trim() || 'opencode'
+    if (!this.deps.resolveExecutable) return command
+    try {
+      const stringEnv: Record<string, string> = {}
+      for (const [k, v] of Object.entries(env)) if (typeof v === 'string') stringEnv[k] = v
+      return await this.deps.resolveExecutable(command, stringEnv)
+    } catch (error) {
+      throw new BridgeError(`OpenCode was not found ("${command}"). ${INSTALL_HINT}`, Codes.OPENCODE_MISSING, undefined, { cause: error })
+    }
+  }
+
+  /** `opencode --version`, with a clear error when the binary is missing or too old. */
+  private probeVersion(file: string, env: NodeJS.ProcessEnv): string {
+    const result = spawnSync(commandFor(file, this.platform), ['--version'], {
+      env,
+      encoding: 'utf8',
+      timeout: 20_000,
+      windowsHide: true,
+      shell: needsShell(file, this.platform),
+    })
+    if (result.error) {
+      const code = (result.error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') throw new BridgeError(`OpenCode was not found ("${file}"). ${INSTALL_HINT}`, Codes.OPENCODE_MISSING)
+      throw new BridgeError(`Could not run "${file} --version": ${result.error.message}`, Codes.OPENCODE_STARTUP)
+    }
+    const text = `${result.stdout ?? ''}`.trim()
+    const version = text.match(/\d+\.\d+\.\d+(?:[-+][\w.-]+)?/)?.[0]
+    if (result.status !== 0 || !version) {
+      throw new BridgeError(`"${file} --version" failed (exit ${result.status}). ${INSTALL_HINT}`, Codes.OPENCODE_STARTUP)
+    }
+    assertVersion(version)
+    return version
+  }
+
+  private async start(settings: RuntimeSettings): Promise<ServerConnection> {
+    if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = undefined }
+    const env = { ...(this.deps.env?.() ?? process.env) }
+    const file = await this.resolveBinary(settings.binaryPath, env)
+    const cliVersion = this.probeVersion(file, env)
+    const api = apiOf(cliVersion)
+
+    const port = await freePort()
+    const password = randomBytes(24).toString('base64url')
+    const childEnv = serverEnvironment(env, password, api)
+    const args = ['serve', `--hostname=${HOSTNAME}`, `--port=${port}`]
+    const child = spawn(commandFor(file, this.platform), args, {
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: this.platform !== 'win32',
+      windowsHide: true,
+      shell: needsShell(file, this.platform),
+    })
+
+    let stdout = ''
+    let stderr = ''
+    let ready = false
+    const url = await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup()
+        killTree(child, 'SIGKILL', this.platform)
+        reject(new BridgeError(`Timed out after ${STARTUP_TIMEOUT_MS / 1000}s waiting for \`opencode serve\` to start.${tail(stderr, password)}`, Codes.OPENCODE_STARTUP))
+      }, STARTUP_TIMEOUT_MS)
+      const onStdout = (chunk: Buffer) => {
+        if (ready) return
+        stdout = (stdout + chunk.toString('utf8')).slice(-OUTPUT_CAP)
+        const found = parseListeningUrl(stdout)
+        if (found) { cleanup(); resolve(found) }
+      }
+      const onStderr = (chunk: Buffer) => { if (!ready) stderr = (stderr + chunk.toString('utf8')).slice(-OUTPUT_CAP) }
+      const onError = (error: NodeJS.ErrnoException) => {
+        cleanup()
+        reject(error.code === 'ENOENT'
+          ? new BridgeError(`OpenCode was not found ("${file}"). ${INSTALL_HINT}`, Codes.OPENCODE_MISSING)
+          : new BridgeError(`Could not start \`opencode serve\`: ${error.message}`, Codes.OPENCODE_STARTUP))
+      }
+      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+        cleanup()
+        const locked = /SQLITE_BUSY|database is locked/i.test(stderr)
+        reject(new BridgeError(
+          `\`opencode serve\` exited before it was ready (${code ?? signal}).${locked ? ' The OpenCode database is locked by another process; try again.' : ''}${tail(stderr, password)}`,
+          Codes.OPENCODE_STARTUP,
+        ))
+      }
+      const cleanup = () => {
+        clearTimeout(timer)
+        child.off('error', onError)
+        child.off('exit', onExit)
+      }
+      // Keep draining both pipes for the life of the process so OpenCode never blocks on a full pipe.
+      child.stdout?.on('data', onStdout)
+      child.stderr?.on('data', onStderr)
+      child.on('error', onError)
+      child.on('exit', onExit)
+    })
+    ready = true
+    stdout = ''
+    stderr = ''
+
+    let version: string
+    try {
+      version = (await verifyServer(url, password, api)).version
+    } catch (error) {
+      killTree(child, 'SIGKILL', this.platform)
+      throw error
+    }
+    if (this.disposed) {
+      killTree(child, 'SIGKILL', this.platform)
+      throw new BridgeError('The OpenCode bridge plugin was disposed.', Codes.TRANSPORT)
+    }
+
+    const connection: ServerConnection = { url, version, api, external: false, password, serial: ++this.serial }
+    this.running = { child, connection, password }
+    this.restartAttempts = 0
+    this.lastError = undefined
+    child.once('exit', (code, signal) => this.onExit(child, code, signal))
+    this.deps.logger.info('opencode-bridge: started OpenCode %s on %s', version, url)
+    return connection
+  }
+
+  private onExit(child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.running?.child !== child) return
+    this.running = undefined
+    // Make sure helpers it spawned (LSPs, MCP servers) go too.
+    killTree(child, 'SIGKILL', this.platform)
+    if (this.disposed) return
+    this.deps.logger.warn('opencode-bridge: OpenCode server exited unexpectedly (%s); restarting', code ?? signal)
+    this.scheduleRestart()
+  }
+
+  private scheduleRestart(): void {
+    if (this.disposed || this.restartTimer || this.restartAttempts >= RESTART_MAX_ATTEMPTS) return
+    const delay = Math.min(RESTART_BASE_MS * 2 ** this.restartAttempts, RESTART_MAX_MS)
+    this.restartAttempts++
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = undefined
+      if (this.disposed || this.running || this.starting) return
+      this.connect().catch((error: unknown) => {
+        this.lastError = error instanceof BridgeError ? error : new BridgeError(describeError(error), Codes.OPENCODE_STARTUP)
+        this.deps.logger.warn('opencode-bridge: restart failed: %s', this.lastError.message)
+        this.scheduleRestart()
+      })
+    }, delay)
+    this.restartTimer.unref?.()
+  }
+
+  /** Synchronous last-resort kill (process exit). */
+  private killNow(): void {
+    const running = this.running
+    this.running = undefined
+    if (running) killTree(running.child, 'SIGKILL', this.platform)
+  }
+
+  /** Stop the server: SIGTERM the group, then SIGKILL after a grace period. */
+  async dispose(): Promise<void> {
+    this.disposed = true
+    process.off('exit', this.exitHook)
+    if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = undefined }
+    const starting = this.starting
+    if (starting) await starting.catch(() => {})
+    const running = this.running
+    this.running = undefined
+    this.external = undefined
+    if (!running) return
+    const { child } = running
+    if (child.exitCode !== null || child.signalCode !== null) {
+      killTree(child, 'SIGKILL', this.platform)
+      return
+    }
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()))
+    killTree(child, 'SIGTERM', this.platform)
+    const timer = new Promise<void>((resolve) => setTimeout(resolve, 2_000).unref?.())
+    await Promise.race([exited, timer])
+    // The group may hold helpers even after the leader exited.
+    killTree(child, 'SIGKILL', this.platform)
+  }
+
+  get lastStartError(): BridgeError | undefined {
+    return this.lastError
+  }
+}
+
+function tail(text: string, password: string): string {
+  const trimmed = redact(text.trim(), [password]).slice(-1500)
+  return trimmed ? `\n${trimmed}` : ''
+}
