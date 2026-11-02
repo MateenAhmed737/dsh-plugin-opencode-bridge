@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-opencode-local",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek Harness (DSH) LLM provider that serves every request through your own installed OpenCode (`opencode serve`), the same way T3 Code does.",
   "keywords": [
     "deepseek-harness",
