@@ -1,6 +1,6 @@
 # Notices
 
-dsh-plugin-opencode-bridge is MIT licensed (see LICENSE). It reuses ideas and
+dsh-plugin-opencode-local is MIT licensed (see LICENSE). It reuses ideas and
 small pieces of code from the projects below, under their MIT licenses.
 
 ## T3 Code
@@ -44,4 +44,4 @@ SOFTWARE.
 The DSH plugin shape (cordis `inject`, `registerAdapter`,
 `registerConfigurableProviders`, the Schemastery config and `cordis.patch.yml`)
 and the local session-title handling follow @quonaro/dsh-plugin-opencode,
-Copyright (c) 2026 quonaro, MIT License.
+Copyright (c) 2026 quonaro, MIT License (https://github.com/quonaro/dsh-plugin-opencode).

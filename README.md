@@ -1,4 +1,10 @@
-# dsh-plugin-opencode-bridge
+# dsh-plugin-opencode-local
+
+## Why this exists
+
+I wanted to use OpenCode's models in DeepSeek Harness through the OpenCode CLI installed on my own machine, the way [T3 Code](https://github.com/pingdotgg/t3code) does. I couldn't find a DeepSeek Harness plugin that did that, so I built this one.
+
+## What it does
 
 A [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) plugin that adds an **OpenCode (local)** model provider. Every request is served by your own installed [OpenCode](https://opencode.ai), the same way [T3 Code](https://github.com/pingdotgg/t3code) does it: one `opencode serve` on `127.0.0.1`, started from your install with your own login and config, driven only through OpenCode's official clients.
 
@@ -19,10 +25,10 @@ Works with OpenCode **1.14.19 or newer**, including **2.x**. Needs Node 22 or ne
    ```
 
 2. Add the plugin to DSH.
-   - **DSH desktop app:** open the plugin manager and add `dsh-plugin-opencode-bridge`.
-   - **DSH CLI:** `dsh plugin --profile <profile> add dsh-plugin-opencode-bridge`.
+   - **DSH desktop app:** open the plugin manager and add `dsh-plugin-opencode-local`.
+   - **DSH CLI:** `dsh plugin --profile <profile> add dsh-plugin-opencode-local`.
 
-   Until it is on npm, install it from GitHub (`github:MateenAhmed737/dsh-plugin-opencode-bridge`) or from a local build (`npm pack`, then add the `.tgz` file).
+   Until it is on npm, install it from GitHub (`github:MateenAhmed737/dsh-plugin-opencode-local`) or from a local build (`npm pack`, then add the `.tgz` file).
 
 3. Restart DSH, open the model picker, and choose a model under **OpenCode (local)**.
 
@@ -30,7 +36,7 @@ The plugin has no install scripts and downloads nothing. If `opencode` can't be 
 
 ## Settings
 
-In DSH under Settings → Models → OpenCode (local), or in your profile's `cordis.patch.yml` under `dsh-plugin-opencode-bridge`.
+In DSH under Settings → Models → OpenCode (local), or in your profile's `cordis.patch.yml` under `dsh-plugin-opencode-local`.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
@@ -101,6 +107,13 @@ npm run check   # typecheck, build to lib/, unit tests
 
 The tests run against a fake `opencode` (`test/fixtures/fake-opencode.mjs`) that speaks both the 1.x and 2.x APIs.
 
+## Credits
+
+- [T3 Code](https://github.com/pingdotgg/t3code) inspired this plugin. The way it runs OpenCode follows T3 Code's OpenCode provider: starting your own `opencode serve` on 127.0.0.1, the permission policy, the OpenCode 1.x/2.x handling and the error messages. Parts are adapted from its code (MIT, © 2026 T3 Tools Inc.).
+- [@quonaro/dsh-plugin-opencode](https://github.com/quonaro/dsh-plugin-opencode) showed the DSH plugin shape and local session titles (MIT).
+
+Details are in [NOTICE.md](NOTICE.md).
+
 ## License
 
-MIT. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for the T3 Code and @quonaro/dsh-plugin-opencode credits.
+MIT. See [LICENSE](LICENSE).

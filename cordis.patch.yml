@@ -1,12 +1,12 @@
-# Bundle config layer for dsh-plugin-opencode-bridge, applied to a DSH profile
+# Bundle config layer for dsh-plugin-opencode-local, applied to a DSH profile
 # when the plugin is installed. The row `id` is also the settings namespace for
 # the plugin's volatile settings, so it must match `name` in package.json.
 #
 # Every setting below can also be changed in DSH under Settings → Models →
 # OpenCode (local).
 - insert:
-  - id: dsh-plugin-opencode-bridge
-    name: dsh-plugin-opencode-bridge
+  - id: dsh-plugin-opencode-local
+    name: dsh-plugin-opencode-local
     config:
       # Path or PATH name of your own opencode executable (>= 1.14.19).
       binaryPath: 'opencode'

@@ -11,7 +11,7 @@
 import { OpenCode, type OpenCodeClient } from '@opencode/client'
 import type { Backend, CreateSessionInput, PermissionAsk, TurnRunInput } from './backend.ts'
 import type { CatalogModel } from './catalog.ts'
-import { BridgeError, Codes, classifyOpenCodeError, classifyThrown, type Failure } from './errors.ts'
+import { PluginError, Codes, classifyOpenCodeError, classifyThrown, type Failure } from './errors.ts'
 import { ALWAYS_ALLOWED, RESTRICTED, describePermission } from './permissions.ts'
 import { basicAuth, type ServerConnection } from './runtime.ts'
 import type { Chunk, FinishReason, TurnOutcome, Usage } from './turn.ts'
@@ -457,7 +457,7 @@ export async function* runTurnV2(client: OpenCodeClient, input: TurnRunInput): A
     }
     return yield* finishWith({ kind: 'error', failure: { message: 'The OpenCode turn ended unexpectedly.', code: Codes.TRANSPORT } })
   } catch (error) {
-    const failure = error instanceof BridgeError ? error.toFailure() : classifyThrown(error)
+    const failure = error instanceof PluginError ? error.toFailure() : classifyThrown(error)
     return yield* finishWith({ kind: 'error', failure })
   } finally {
     input.signal?.removeEventListener('abort', onAbort)

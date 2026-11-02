@@ -2,7 +2,7 @@
 /**
  * A fake `opencode` executable for tests. It speaks just enough of the
  * OpenCode 1.x (`/global/health`, `/session`, `/event`) or 2.x (`/api/*`) HTTP
- * API for the bridge, chosen by FAKE_OC_VERSION.
+ * API for the plugin, chosen by FAKE_OC_VERSION.
  *
  *   fake-opencode --version
  *   fake-opencode serve --hostname=127.0.0.1 --port=N

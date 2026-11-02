@@ -1,5 +1,5 @@
 {
-  "name": "dsh-plugin-opencode-bridge",
+  "name": "dsh-plugin-opencode-local",
   "version": "0.1.0",
   "description": "DeepSeek Harness (DSH) LLM provider that serves every request through your own installed OpenCode (`opencode serve`), the same way T3 Code does.",
   "keywords": [
@@ -14,10 +14,10 @@
   "author": "Mateen Ahmed (https://github.com/MateenAhmed737)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MateenAhmed737/dsh-plugin-opencode-bridge.git"
+    "url": "git+https://github.com/MateenAhmed737/dsh-plugin-opencode-local.git"
   },
-  "bugs": "https://github.com/MateenAhmed737/dsh-plugin-opencode-bridge/issues",
-  "homepage": "https://github.com/MateenAhmed737/dsh-plugin-opencode-bridge#readme",
+  "bugs": "https://github.com/MateenAhmed737/dsh-plugin-opencode-local/issues",
+  "homepage": "https://github.com/MateenAhmed737/dsh-plugin-opencode-local#readme",
   "publishConfig": {
     "access": "public",
     "provenance": true

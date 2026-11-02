@@ -68,9 +68,9 @@ export function configContent(existing: string | undefined): string {
 /** Message the model receives when a restricted tool is rejected. */
 export function rejectionMessage(permission: string, reason: 'policy' | 'user' | 'unavailable' | 'cancelled'): string {
   const why = {
-    policy: 'it is restricted by the DeepSeek Harness OpenCode bridge policy',
+    policy: 'it is restricted by the DeepSeek Harness OpenCode (local) plugin policy',
     user: 'the user rejected it',
-    unavailable: 'no approval prompt was available, so the bridge rejected it',
+    unavailable: 'no approval prompt was available, so the plugin rejected it',
     cancelled: 'the approval was cancelled',
   }[reason]
   return `Permission "${permission}" was not granted: ${why}. Do not retry this action; continue without it or tell the user what you would need.`

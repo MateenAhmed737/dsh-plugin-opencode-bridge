@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { after, before, describe, it } from 'node:test'
-import { OpenCodeBridgeAdapter, type AdapterSettings, type GenerateRequest } from '../src/adapter.ts'
+import { OpenCodeLocalAdapter, type AdapterSettings, type GenerateRequest } from '../src/adapter.ts'
 import { Codes } from '../src/errors.ts'
 import type { OpenCodeRuntime } from '../src/runtime.ts'
 import type { Chunk } from '../src/turn.ts'
@@ -9,7 +9,7 @@ import { makeRuntime, quietLogger, readLog, tempLog } from './helpers.ts'
 const PNG = Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64'))
 
 interface Harness {
-  adapter: OpenCodeBridgeAdapter
+  adapter: OpenCodeLocalAdapter
   settings: AdapterSettings
   services: Record<string, unknown>
 }
@@ -30,7 +30,7 @@ function harness(runtime: OpenCodeRuntime): Harness {
       readImageRequest: async () => ({ data: PNG, mediaType: 'image/png' }),
     },
   }
-  const adapter = new OpenCodeBridgeAdapter({
+  const adapter = new OpenCodeLocalAdapter({
     ctx: { get: (name: string) => services[name] },
     runtime,
     logger: quietLogger,
@@ -39,9 +39,9 @@ function harness(runtime: OpenCodeRuntime): Harness {
   return { adapter, settings, services }
 }
 
-async function run(adapter: OpenCodeBridgeAdapter, request: Partial<GenerateRequest> & { messages: GenerateRequest['messages'] }) {
+async function run(adapter: OpenCodeLocalAdapter, request: Partial<GenerateRequest> & { messages: GenerateRequest['messages'] }) {
   const chunks: Chunk[] = []
-  for await (const chunk of adapter.stream({ provider: 'opencode-bridge', model: 'opencode/big-pickle', ...request })) chunks.push(chunk)
+  for await (const chunk of adapter.stream({ provider: 'opencode-local', model: 'opencode/big-pickle', ...request })) chunks.push(chunk)
   const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
   const finish = chunks.findLast((c) => c.type === 'finish') as Extract<Chunk, { type: 'finish' }>
@@ -70,11 +70,11 @@ for (const version of ['1.15.0', '2.2.5']) {
     })
 
     it('lists the server\'s models with provider/model ids, free models first', async () => {
-      const models = await adapter.listModels('opencode-bridge')
+      const models = await adapter.listModels('opencode-local')
       assert.deepEqual(models.map((m) => m.id), ['opencode/big-pickle', 'anthropic/claude-x'])
       assert.equal(models[0]!.name, 'Big Pickle (free)')
       assert.deepEqual(models[0]!.inputModalities, ['text', 'image'])
-      const resolved = await adapter.resolveModel('opencode-bridge', 'opencode/big-pickle')
+      const resolved = await adapter.resolveModel('opencode-local', 'opencode/big-pickle')
       assert.equal(resolved.context?.contextWindow, 200000)
       assert.ok(resolved.reasoning?.efforts.some((e) => e.id === 'high'))
     })
@@ -141,7 +141,7 @@ for (const version of ['1.15.0', '2.2.5']) {
       const failure = (result.finish as { failure: { code: string; message: string } }).failure
       assert.equal(failure.code, Codes.RATE_LIMIT)
       assert.equal(failure.message, 'FreeUsageLimitError: Rate limit exceeded. Please try again later.')
-      assert.deepEqual(adapter.providerRetryPolicy('opencode-bridge').retryableCodes, ['TRANSPORT'])
+      assert.deepEqual(adapter.providerRetryPolicy('opencode-local').retryableCodes, ['TRANSPORT'])
     })
 
     it('aborts a running turn and interrupts OpenCode', async () => {

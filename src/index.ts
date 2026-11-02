@@ -1,5 +1,5 @@
 /**
- * dsh-plugin-opencode-bridge — a DeepSeek Harness LLM provider that serves
+ * dsh-plugin-opencode-local — a DeepSeek Harness LLM provider that serves
  * every request through the user's own installed OpenCode, the way T3 Code
  * does: one shared `opencode serve` on 127.0.0.1 started with the user's full
  * environment (their login and config), driven only through OpenCode's
@@ -8,16 +8,16 @@
  * Plugin shape (inject, registerAdapter, registerConfigurableProviders,
  * Schemastery Config, cordis.patch.yml) follows @quonaro/dsh-plugin-opencode.
  *
- * @module dsh-plugin-opencode-bridge
+ * @module dsh-plugin-opencode-local
  */
 
 import type { Context, Volatile } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
-import { OpenCodeBridgeAdapter, PROVIDER_ID, PROVIDER_NAME } from './adapter.ts'
+import { OpenCodeLocalAdapter, PROVIDER_ID, PROVIDER_NAME } from './adapter.ts'
 import { OpenCodeRuntime } from './runtime.ts'
 
 /** Plugin name; must match package.json and the cordis.patch.yml row. */
-export const name = 'dsh-plugin-opencode-bridge'
+export const name = 'dsh-plugin-opencode-local'
 
 /** `llm` registers the provider; `subprocess` resolves the opencode executable the way DSH does. */
 export const inject = ['llm', 'subprocess']
@@ -96,7 +96,7 @@ export function apply(ctx: Context, config: Config): void {
     logger,
   })
 
-  const adapter = new OpenCodeBridgeAdapter({
+  const adapter = new OpenCodeLocalAdapter({
     ctx: host,
     runtime,
     logger,
@@ -136,5 +136,5 @@ export function apply(ctx: Context, config: Config): void {
   })
 }
 
-export { OpenCodeBridgeAdapter } from './adapter.ts'
+export { OpenCodeLocalAdapter } from './adapter.ts'
 export { OpenCodeRuntime } from './runtime.ts'
