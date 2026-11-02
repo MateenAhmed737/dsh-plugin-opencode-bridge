@@ -477,8 +477,7 @@ export class OpenCodeRuntime {
       killTree(child, 'SIGKILL', this.platform)
       throw error
     }
-    const descendants = shell && child.pid !== undefined ? await windowsDescendants(child.pid) : []
-    const pids = [...new Set([child.pid, serverPid, ...descendants])].filter((pid): pid is number => typeof pid === 'number' && pid > 0)
+    const pids = [...new Set([child.pid, serverPid])].filter((pid): pid is number => typeof pid === 'number' && pid > 0)
     if (this.disposed) {
       killTree(child, 'SIGKILL', this.platform)
       killPids(pids, this.platform)
@@ -486,12 +485,27 @@ export class OpenCodeRuntime {
     }
 
     const connection: ServerConnection = { url, version, api, external: false, password, serial: ++this.serial }
-    const watchdog = startWatchdog(pids, this.deps.logger)
-    this.running = { child, watchdog, pids, connection, password }
+    const running: Running = { child, watchdog: undefined, pids, connection, password }
+    this.running = running
     this.restartAttempts = 0
     this.lastError = undefined
     child.once('exit', (code, signal) => this.onExit(child, code, signal))
     this.deps.logger.info('opencode-bridge: started OpenCode %s on %s', version, url)
+    if (shell && child.pid !== undefined) {
+      // Listing processes takes a second or two on Windows; don't hold up the first request.
+      void windowsDescendants(child.pid).then((descendants) => {
+        const extra = descendants.filter((pid) => !running.pids.includes(pid))
+        if (this.running !== running) {
+          // Exited or disposed meanwhile: make sure nothing below the shim survives.
+          killPids(extra, this.platform)
+          return
+        }
+        running.pids.push(...extra)
+        running.watchdog = startWatchdog(running.pids, this.deps.logger)
+      })
+    } else {
+      running.watchdog = startWatchdog(running.pids, this.deps.logger)
+    }
     return connection
   }
 
