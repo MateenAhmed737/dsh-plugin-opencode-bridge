@@ -28,7 +28,7 @@ Works with OpenCode **1.14.19 or newer**, including **2.x**. Needs Node 22 or ne
    - **DSH desktop app:** open the plugin manager and add `dsh-plugin-opencode-local`.
    - **DSH CLI:** `dsh plugin --profile <profile> add dsh-plugin-opencode-local`.
 
-   Until it is on npm, install it from GitHub (`github:MateenAhmed737/dsh-plugin-opencode-local`) or from a local build (`npm pack`, then add the `.tgz` file).
+   To try an unreleased version, build it (`npm ci && npm pack`) and add the `.tgz` file instead.
 
 3. Restart DSH, open the model picker, and choose a model under **OpenCode (local)**.
 
