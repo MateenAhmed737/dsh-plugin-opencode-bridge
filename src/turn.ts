@@ -11,7 +11,7 @@
  */
 
 import type { OpencodeClient } from '@opencode-ai/sdk/v2/client'
-import { BridgeError, Codes, classifyOpenCodeError, classifyThrown, type Failure, type OpenCodeErrorLike } from './errors.ts'
+import { PluginError, Codes, classifyOpenCodeError, classifyThrown, type Failure, type OpenCodeErrorLike } from './errors.ts'
 import { describePermission } from './permissions.ts'
 
 /** Structural copy of DSH's StreamChunk (kept local so the plugin has no runtime import of dsh-llm). */
@@ -299,7 +299,7 @@ export async function* runTurn(input: TurnInput): AsyncGenerator<Chunk, TurnOutc
         throw classifiedThrow(signal.error)
       }
       if (signal.kind === 'stream-ended') {
-        throw new BridgeError(
+        throw new PluginError(
           'Lost the connection to the local OpenCode server before the reply finished.',
           Codes.TRANSPORT, undefined, { cause: signal.error },
         )
@@ -466,9 +466,9 @@ function* drain(pending: Chunk[]): Generator<Chunk, void> {
   while (pending.length) yield pending.shift()!
 }
 
-function classifiedThrow(err: unknown): BridgeError {
+function classifiedThrow(err: unknown): PluginError {
   const failure = classifyThrown(err)
-  return new BridgeError(failure.message, failure.code, failure.status, { cause: err })
+  return new PluginError(failure.message, failure.code, failure.status, { cause: err })
 }
 
 function toUsage(u: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }): Usage {

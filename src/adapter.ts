@@ -8,13 +8,13 @@ import type { Context } from '@deepseek-ai/cordis'
 import { makeBackend, type Backend, type ImageInput, type PermissionAsk } from './backend.ts'
 import type { BackendV2 } from './backend-v2.ts'
 import { parseModelId, type CatalogModel } from './catalog.ts'
-import { BridgeError, Codes, classifyThrown, describeError } from './errors.ts'
+import { PluginError, Codes, classifyThrown, describeError } from './errors.ts'
 import { ALWAYS_ALLOWED, describePermission, rejectionMessage } from './permissions.ts'
 import type { OpenCodeRuntime } from './runtime.ts'
 import { conversation, digest, rebuildPreamble, SessionMap, splitNewTurn, turnText, type Block, type ImageRef, type Msg, type Turn } from './transcript.ts'
 import type { Chunk, FinishReason, PermissionDecision, TurnOutcome } from './turn.ts'
 
-export const PROVIDER_ID = 'opencode-bridge'
+export const PROVIDER_ID = 'opencode-local'
 export const PROVIDER_NAME = 'OpenCode (local)'
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024
 const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
@@ -75,7 +75,7 @@ export interface AdapterDeps {
   onModelsChanged?(): void
 }
 
-export class OpenCodeBridgeAdapter {
+export class OpenCodeLocalAdapter {
   private backend: Backend | undefined
   private catalog: { at: number; models: CatalogModel[]; key: string } | undefined
   private catalogLoading: Promise<CatalogModel[]> | undefined
@@ -110,7 +110,7 @@ export class OpenCodeBridgeAdapter {
     try {
       models = await this.models()
     } catch (error) {
-      this.deps.logger.warn('opencode-bridge: could not list OpenCode models: %s', describeError(error))
+      this.deps.logger.warn('opencode-local: could not list OpenCode models: %s', describeError(error))
       return []
     }
     return models.map((model) => ({
@@ -241,7 +241,7 @@ export class OpenCodeBridgeAdapter {
         signal,
       })
     } catch (error) {
-      this.deps.logger.debug('opencode-bridge: approval prompt failed: %s', describeError(error))
+      this.deps.logger.debug('opencode-local: approval prompt failed: %s', describeError(error))
       outcome = 'unavailable'
     }
     if (outcome === 'allowed-once') return { reply: 'once' }
@@ -299,7 +299,7 @@ export class OpenCodeBridgeAdapter {
     const ephemeral = !options.sessionId || options.purpose !== undefined
     const key = ephemeral ? `ephemeral:${Math.random()}` : `dsh:${options.sessionId}`
 
-    yield* this.sessions.lockGen(key, async function* (this: OpenCodeBridgeAdapter): AsyncGenerator<Chunk, void> {
+    yield* this.sessions.lockGen(key, async function* (this: OpenCodeLocalAdapter): AsyncGenerator<Chunk, void> {
       const existing = ephemeral ? undefined : this.sessions.get(key)
       const historyDigest = digest(history)
       const reuse = !!existing && existing.directory === directory && existing.digest === historyDigest && newTurn.length > 0
@@ -411,4 +411,4 @@ function* localTitle(messages: readonly Msg[]): Generator<Chunk, void> {
   yield { type: 'finish', reason: { kind: 'stop' } }
 }
 
-export { BridgeError }
+export { PluginError }

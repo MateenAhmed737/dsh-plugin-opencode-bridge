@@ -31,12 +31,12 @@ export const Codes = {
 } as const
 
 /** Error carrying a classified failure; thrown internally and turned into a finish chunk. */
-export class BridgeError extends Error {
+export class PluginError extends Error {
   readonly code: string
   readonly status: number | undefined
   constructor(message: string, code: string, status?: number, options?: ErrorOptions) {
     super(message, options)
-    this.name = 'BridgeError'
+    this.name = 'PluginError'
     this.code = code
     this.status = status
   }
@@ -117,7 +117,7 @@ export function classifyOpenCodeError(error: OpenCodeErrorLike | undefined): Fai
  * a transport failure: the request never got a model answer.
  */
 export function classifyThrown(value: unknown): Failure {
-  if (value instanceof BridgeError) return value.toFailure()
+  if (value instanceof PluginError) return value.toFailure()
   if (value && typeof value === 'object') {
     const record = value as Record<string, unknown>
     // SDK error bodies with throwOnError: { name, data } or { error: {...} }

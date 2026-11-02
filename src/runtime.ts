@@ -18,7 +18,7 @@ import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
-import { BridgeError, Codes, describeError, redact } from './errors.ts'
+import { PluginError, Codes, describeError, redact } from './errors.ts'
 import { configContent } from './permissions.ts'
 import { compareSemver, parseSemver } from './semver.ts'
 
@@ -116,10 +116,10 @@ export async function verifyServer(url: string, password: string | undefined, ap
     try {
       result = await getJson(`${base}${generation === 'v2' ? '/api/info' : '/global/health'}`, password)
     } catch (error) {
-      throw new BridgeError(`Could not reach the OpenCode server at ${url}: ${describeError(error)}`, Codes.TRANSPORT, undefined, { cause: error })
+      throw new PluginError(`Could not reach the OpenCode server at ${url}: ${describeError(error)}`, Codes.TRANSPORT, undefined, { cause: error })
     }
     if (result.status === 401) {
-      throw new BridgeError(`The OpenCode server at ${url} rejected the server password.`, Codes.AUTH, 401)
+      throw new PluginError(`The OpenCode server at ${url} rejected the server password.`, Codes.AUTH, 401)
     }
     lastStatus = result.status
     const body = result.json as { version?: unknown; healthy?: unknown; pid?: unknown } | undefined
@@ -129,7 +129,7 @@ export async function verifyServer(url: string, password: string | undefined, ap
     assertVersion(body.version)
     return { version: body.version, api: generation, ...(typeof body.pid === 'number' ? { pid: body.pid } : {}) }
   }
-  throw new BridgeError(
+  throw new PluginError(
     `The server at ${url} did not answer like an OpenCode server${lastStatus ? ` (HTTP ${lastStatus})` : ''}. OpenCode v${MINIMUM_OPENCODE_VERSION} or newer is required.`,
     Codes.OPENCODE_VERSION,
   )
@@ -137,10 +137,10 @@ export async function verifyServer(url: string, password: string | undefined, ap
 
 export function assertVersion(version: string): void {
   if (parseSemver(version) === null) {
-    throw new BridgeError(`OpenCode reported an unreadable version "${version}". OpenCode v${MINIMUM_OPENCODE_VERSION} or newer is required.`, Codes.OPENCODE_VERSION)
+    throw new PluginError(`OpenCode reported an unreadable version "${version}". OpenCode v${MINIMUM_OPENCODE_VERSION} or newer is required.`, Codes.OPENCODE_VERSION)
   }
   if (compareSemver(version, MINIMUM_OPENCODE_VERSION) < 0) {
-    throw new BridgeError(`OpenCode v${version} is too old. Upgrade to v${MINIMUM_OPENCODE_VERSION} or newer (\`opencode upgrade\` or \`npm i -g opencode-ai@latest\`).`, Codes.OPENCODE_VERSION)
+    throw new PluginError(`OpenCode v${version} is too old. Upgrade to v${MINIMUM_OPENCODE_VERSION} or newer (\`opencode upgrade\` or \`npm i -g opencode-ai@latest\`).`, Codes.OPENCODE_VERSION)
   }
 }
 
@@ -324,7 +324,7 @@ export function startWatchdog(targets: readonly number[], logger?: Logger): Chil
     watchdog.unref()
     return watchdog
   } catch (error) {
-    logger?.debug('opencode-bridge: watchdog not started: %s', describeError(error))
+    logger?.debug('opencode-local: watchdog not started: %s', describeError(error))
     return undefined
   }
 }
@@ -342,7 +342,7 @@ export class OpenCodeRuntime {
   private serial = 0
   private restartAttempts = 0
   private restartTimer: NodeJS.Timeout | undefined
-  private lastError: BridgeError | undefined
+  private lastError: PluginError | undefined
   private readonly platform: NodeJS.Platform
   private readonly exitHook = () => this.killNow()
 
@@ -356,7 +356,7 @@ export class OpenCodeRuntime {
 
   /** Current connection, starting or attaching as needed. */
   async connect(): Promise<ServerConnection> {
-    if (this.disposed) throw new BridgeError('The OpenCode bridge plugin was disposed.', Codes.TRANSPORT)
+    if (this.disposed) throw new PluginError('The OpenCode (local) plugin was disposed.', Codes.TRANSPORT)
     const settings = this.deps.settings()
     const serverUrl = settings.serverUrl.trim()
     if (serverUrl) return this.attach(serverUrl, settings.serverPassword)
@@ -378,7 +378,7 @@ export class OpenCodeRuntime {
     const { version, api } = await verifyServer(url, password || undefined)
     this.externalKey = key
     this.external = { url, version, api, external: true, password: password || undefined, serial: ++this.serial }
-    this.deps.logger.info('opencode-bridge: attached to OpenCode %s at %s', version, url)
+    this.deps.logger.info('opencode-local: attached to OpenCode %s at %s', version, url)
     return this.external
   }
 
@@ -390,7 +390,7 @@ export class OpenCodeRuntime {
       for (const [k, v] of Object.entries(env)) if (typeof v === 'string') stringEnv[k] = v
       return await this.deps.resolveExecutable(command, stringEnv)
     } catch (error) {
-      throw new BridgeError(`OpenCode was not found ("${command}"). ${INSTALL_HINT}`, Codes.OPENCODE_MISSING, undefined, { cause: error })
+      throw new PluginError(`OpenCode was not found ("${command}"). ${INSTALL_HINT}`, Codes.OPENCODE_MISSING, undefined, { cause: error })
     }
   }
 
@@ -406,13 +406,13 @@ export class OpenCodeRuntime {
     })
     if (result.error) {
       const code = (result.error as NodeJS.ErrnoException).code
-      if (code === 'ENOENT') throw new BridgeError(`OpenCode was not found ("${file}"). ${INSTALL_HINT}`, Codes.OPENCODE_MISSING)
-      throw new BridgeError(`Could not run "${file} --version": ${result.error.message}`, Codes.OPENCODE_STARTUP)
+      if (code === 'ENOENT') throw new PluginError(`OpenCode was not found ("${file}"). ${INSTALL_HINT}`, Codes.OPENCODE_MISSING)
+      throw new PluginError(`Could not run "${file} --version": ${result.error.message}`, Codes.OPENCODE_STARTUP)
     }
     const text = `${result.stdout ?? ''}`.trim()
     const version = text.match(/\d+\.\d+\.\d+(?:[-+][\w.-]+)?/)?.[0]
     if (result.status !== 0 || !version) {
-      throw new BridgeError(`"${file} --version" failed (exit ${result.status}). ${INSTALL_HINT}`, Codes.OPENCODE_STARTUP)
+      throw new PluginError(`"${file} --version" failed (exit ${result.status}). ${INSTALL_HINT}`, Codes.OPENCODE_STARTUP)
     }
     assertVersion(version)
     return version
@@ -445,7 +445,7 @@ export class OpenCodeRuntime {
       const timer = setTimeout(() => {
         cleanup()
         killTree(child, 'SIGKILL', this.platform)
-        reject(new BridgeError(`Timed out after ${STARTUP_TIMEOUT_MS / 1000}s waiting for \`opencode serve\` to start.${tail(stderr, password)}`, Codes.OPENCODE_STARTUP))
+        reject(new PluginError(`Timed out after ${STARTUP_TIMEOUT_MS / 1000}s waiting for \`opencode serve\` to start.${tail(stderr, password)}`, Codes.OPENCODE_STARTUP))
       }, STARTUP_TIMEOUT_MS)
       const onStdout = (chunk: Buffer) => {
         if (ready) return
@@ -457,13 +457,13 @@ export class OpenCodeRuntime {
       const onError = (error: NodeJS.ErrnoException) => {
         cleanup()
         reject(error.code === 'ENOENT'
-          ? new BridgeError(`OpenCode was not found ("${file}"). ${INSTALL_HINT}`, Codes.OPENCODE_MISSING)
-          : new BridgeError(`Could not start \`opencode serve\`: ${error.message}`, Codes.OPENCODE_STARTUP))
+          ? new PluginError(`OpenCode was not found ("${file}"). ${INSTALL_HINT}`, Codes.OPENCODE_MISSING)
+          : new PluginError(`Could not start \`opencode serve\`: ${error.message}`, Codes.OPENCODE_STARTUP))
       }
       const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
         cleanup()
         const locked = /SQLITE_BUSY|database is locked/i.test(stderr)
-        reject(new BridgeError(
+        reject(new PluginError(
           `\`opencode serve\` exited before it was ready (${code ?? signal}).${locked ? ' The OpenCode database is locked by another process; try again.' : ''}${tail(stderr, password)}`,
           Codes.OPENCODE_STARTUP,
         ))
@@ -497,7 +497,7 @@ export class OpenCodeRuntime {
     if (this.disposed) {
       killTree(child, 'SIGKILL', this.platform)
       killPids(pids, this.platform)
-      throw new BridgeError('The OpenCode bridge plugin was disposed.', Codes.TRANSPORT)
+      throw new PluginError('The OpenCode (local) plugin was disposed.', Codes.TRANSPORT)
     }
 
     const connection: ServerConnection = { url, version, api, external: false, password, serial: ++this.serial }
@@ -506,7 +506,7 @@ export class OpenCodeRuntime {
     this.restartAttempts = 0
     this.lastError = undefined
     child.once('exit', (code, signal) => this.onExit(child, code, signal))
-    this.deps.logger.info('opencode-bridge: started OpenCode %s on %s', version, url)
+    this.deps.logger.info('opencode-local: started OpenCode %s on %s', version, url)
     running.watchdog = startWatchdog(running.pids, this.deps.logger)
     if (shell && child.pid !== undefined) {
       // For dispose and crash cleanup: the processes below the shim (listing them takes a second or two).
@@ -531,7 +531,7 @@ export class OpenCodeRuntime {
     killTree(child, 'SIGKILL', this.platform)
     killPids(running.pids.filter((pid) => pid !== child.pid), this.platform)
     if (this.disposed) return
-    this.deps.logger.warn('opencode-bridge: OpenCode server exited unexpectedly (%s); restarting', code ?? signal)
+    this.deps.logger.warn('opencode-local: OpenCode server exited unexpectedly (%s); restarting', code ?? signal)
     this.scheduleRestart()
   }
 
@@ -543,8 +543,8 @@ export class OpenCodeRuntime {
       this.restartTimer = undefined
       if (this.disposed || this.running || this.starting) return
       this.connect().catch((error: unknown) => {
-        this.lastError = error instanceof BridgeError ? error : new BridgeError(describeError(error), Codes.OPENCODE_STARTUP)
-        this.deps.logger.warn('opencode-bridge: restart failed: %s', this.lastError.message)
+        this.lastError = error instanceof PluginError ? error : new PluginError(describeError(error), Codes.OPENCODE_STARTUP)
+        this.deps.logger.warn('opencode-local: restart failed: %s', this.lastError.message)
         this.scheduleRestart()
       })
     }, delay)
@@ -590,7 +590,7 @@ export class OpenCodeRuntime {
     stopWatchdog()
   }
 
-  get lastStartError(): BridgeError | undefined {
+  get lastStartError(): PluginError | undefined {
     return this.lastError
   }
 }

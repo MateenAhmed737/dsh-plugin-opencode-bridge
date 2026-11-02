@@ -11,7 +11,7 @@ export const FAKE_OPENCODE = process.platform === 'win32' ? windowsShim() : FAKE
 
 function windowsShim(): string {
   // A directory with a space, like C:\Users\First Last\AppData\Roaming\npm.
-  const file = join(mkdtempSync(join(tmpdir(), 'oc bridge ')), 'opencode.cmd')
+  const file = join(mkdtempSync(join(tmpdir(), 'oc local ')), 'opencode.cmd')
   writeFileSync(file, `@"${process.execPath}" "${FAKE_SCRIPT}" %*\r\n`)
   return file
 }
@@ -24,7 +24,7 @@ export interface LogEntry {
 }
 
 export function tempLog(): string {
-  return join(mkdtempSync(join(tmpdir(), 'oc-bridge-')), 'fake.jsonl')
+  return join(mkdtempSync(join(tmpdir(), 'oc-local-')), 'fake.jsonl')
 }
 
 export function readLog(file: string): LogEntry[] {
