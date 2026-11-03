@@ -48,6 +48,12 @@ Restricted OpenCode tools (shell, file edits, web fetch) go through DSH's approv
 
 3. Restart DSH, open the model picker, and choose a model under **OpenCode (local)**.
 
+   <img src="https://raw.githubusercontent.com/MateenAhmed737/dsh-plugin-opencode-local/main/docs/model-picker.png" alt="DSH model picker listing OpenCode (local) models" width="360">
+
+   The provider also shows up in **Settings → Models**, where **Edit** opens its settings:
+
+   <img src="https://raw.githubusercontent.com/MateenAhmed737/dsh-plugin-opencode-local/main/docs/settings-models.png" alt="DSH Settings, Models page with OpenCode (local) listed" width="560">
+
 The plugin has no install scripts and downloads nothing. If `opencode` can't be found, the first request tells you how to install it or where to point `binaryPath`.
 
 ## Settings
