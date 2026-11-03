@@ -12,7 +12,17 @@ A [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) plugin that adds an *
 - Your login: the plugin never reads, copies or forwards `auth.json` or any credential. OpenCode uses its own.
 - Your machine: all model traffic goes through your `opencode` process. The plugin makes no calls to `opencode.ai` or any other host, uses no proxies, and sets no custom headers or user agent.
 
-Works with OpenCode **1.14.19 or newer**, including **2.x**. Needs Node 22 or newer (DSH ships its own).
+## Compatibility
+
+| | |
+|---|---|
+| DeepSeek Harness | 0.2.x (tested on 0.2.1-rc.5) |
+| DSH profiles | Desktop app and CLI/headless profiles |
+| OpenCode | 1.14.19 or newer, including 2.x |
+| Platforms | Windows (tested end to end), Linux (CI); macOS should work but is untested |
+| Node | 22.19 or newer (DSH ships its own) |
+
+Restricted OpenCode tools (shell, file edits, web fetch) go through DSH's approval prompt; see [Permission policy](#permission-policy).
 
 ## Install
 
@@ -26,7 +36,13 @@ Works with OpenCode **1.14.19 or newer**, including **2.x**. Needs Node 22 or ne
 
 2. Add the plugin to DSH.
    - **DSH desktop app:** open the plugin manager and add `dsh-plugin-opencode-local`.
-   - **DSH CLI:** `dsh plugin --profile <profile> add dsh-plugin-opencode-local`.
+   - **DSH CLI:**
+
+     ```sh
+     dsh plugin --profile web add dsh-plugin-opencode-local
+     ```
+
+     Use the name of your own profile in place of `web`, for example `desktop` or `headless`.
 
    To try an unreleased version, build it (`npm ci && npm pack`) and add the `.tgz` file instead.
 
